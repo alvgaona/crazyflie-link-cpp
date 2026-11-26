@@ -94,6 +94,13 @@ target_link_libraries(crazyflieLinkCpp
   PRIVATE
     ${LIBUSB_LIBRARY}
 )
+if (APPLE)
+  # a static libusb needs these; the linker flags above only reach targets in this directory
+  target_link_libraries(crazyflieLinkCpp
+    PUBLIC
+      objc "-framework IOKit" "-framework CoreFoundation" "-framework Security"
+  )
+endif()
 set_property(TARGET crazyflieLinkCpp PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_target_properties(crazyflieLinkCpp PROPERTIES
   CXX_VISIBILITY_PRESET default
