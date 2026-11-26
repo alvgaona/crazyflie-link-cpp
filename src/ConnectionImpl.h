@@ -4,6 +4,8 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <atomic>
+#include <thread>
 
 #include "Crazyradio.h"
 #include "CrazyflieUSB.h"
@@ -44,6 +46,15 @@ public:
     std::priority_queue<Packet, std::vector<Packet>, std::greater<Packet>> queue_recv_;
 
     std::string runtime_error_;
+
+    // UDP (simulators such as CrazySim): "udp://host:port" is one Crazyflie; "udpbroadcast://host"
+    // sends each packet to every open udp:// connection to that host.
+    bool isUdp_ = false;
+    bool udpBroadcast_ = false;
+    std::string udpHost_;
+    int udpSocket_ = -1;
+    std::thread udpThread_;
+    std::atomic<bool> udpStop_{false};
 };
 
 } // namespace crazyflieLinkCpp

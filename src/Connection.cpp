@@ -1,6 +1,7 @@
 #include <regex>
 #include <iostream>
 #include <future>
+#include <chrono>
 
 #include "crazyflieLinkCpp/Connection.h"
 #include "ConnectionImpl.h"
@@ -10,8 +11,34 @@
 
 #include <libusb.h>
 
+#ifndef _WIN32
+#include <algorithm>
+#include <netdb.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 namespace bitcraze {
 namespace crazyflieLinkCpp {
+
+#ifndef _WIN32
+namespace {
+// open udp:// connections, so udpbroadcast:// can fan out to them
+std::mutex udp_registry_mutex;
+std::vector<std::shared_ptr<ConnectionImpl>> udp_registry;
+
+// errors (e.g. ECONNREFUSED while the simulator is not up yet) drop the packet, like a lost radio packet
+// UDP has no acks: every delivered packet counts as sent and acked
+void udp_send(ConnectionImpl& impl, const Packet& p)
+{
+  if (::send(impl.udpSocket_, p.raw(), p.size(), 0) == (ssize_t)p.size()) {
+    ++impl.statistics_.sent_count;
+    ++impl.statistics_.ack_count;
+  }
+}
+} // namespace
+#endif
 
 Connection::Connection(const std::string &uri)
     : impl_(std::make_shared<ConnectionImpl>())
@@ -22,6 +49,86 @@ Connection::Connection(const std::string &uri)
   // "radio://*/80/2M/E7E7E7E7E7" -> auto-pick radio
   // "radio://*/80/2M/*" -> broadcast/P2P sniffing on channel 80
   // "radiobroadcast://0/80/2M -> broadcast to all crazyflies on channel 80
+
+  // "udp://127.0.0.1:19850" -> one Crazyflie in a simulator
+  // "udpbroadcast://127.0.0.1" -> every udp:// connection to that host
+  const std::regex udp_regex("(udp:\\/\\/([\\w.\\-]+):(\\d+))|(udpbroadcast:\\/\\/([\\w.\\-]+))");
+  std::smatch udp_match;
+  if (std::regex_match(uri, udp_match, udp_regex)) {
+#ifdef _WIN32
+    throw std::runtime_error("udp:// is not supported on Windows");
+#else
+    impl_->uri_ = uri;
+    impl_->devid_ = -1;
+    impl_->isRadio_ = false;
+    impl_->isUdp_ = true;
+    if (udp_match[4].matched) {
+      impl_->udpBroadcast_ = true;
+      impl_->udpHost_ = udp_match[5].str();
+      return;
+    }
+    impl_->udpHost_ = udp_match[2].str();
+
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    addrinfo* addr = nullptr;
+    if (getaddrinfo(impl_->udpHost_.c_str(), udp_match[3].str().c_str(), &hints, &addr) != 0) {
+      throw std::runtime_error("Cannot resolve host of uri (" + uri + ")!");
+    }
+    impl_->udpSocket_ = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+    bool ok = impl_->udpSocket_ >= 0 && connect(impl_->udpSocket_, addr->ai_addr, addr->ai_addrlen) == 0;
+    freeaddrinfo(addr);
+    if (!ok) {
+      if (impl_->udpSocket_ >= 0) {
+        ::close(impl_->udpSocket_);
+      }
+      throw std::runtime_error("Cannot open UDP socket for uri (" + uri + ")!");
+    }
+
+    ConnectionImpl* impl = impl_.get();  // the thread is joined in close(), before impl_ goes away
+    impl_->udpThread_ = std::thread([impl]() {
+      // Like the radio's autoping: the firmware stops logging 1 s after the last uplink packet
+      // (RADIO_ACTIVITY_TIMEOUT_MS), so keep the link alive with null packets.
+      const uint8_t ping[] = {0xFF};
+      const auto ping_period = std::chrono::milliseconds(100);
+      auto next_ping = std::chrono::steady_clock::now();
+      uint8_t buf[CRTP_MAXSIZE];
+      while (!impl->udpStop_) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= next_ping) {
+          if (::send(impl->udpSocket_, ping, sizeof(ping), 0) == (ssize_t)sizeof(ping)) {
+            ++impl->statistics_.sent_count;  // the radio counts pings as sent and acked too
+            ++impl->statistics_.sent_ping_count;
+            ++impl->statistics_.ack_count;
+          }
+          next_ping = now + ping_period;
+        }
+        pollfd pfd{impl->udpSocket_, POLLIN, 0};
+        int wait_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(next_ping - now).count();
+        if (poll(&pfd, 1, wait_ms) <= 0) {
+          continue;
+        }
+        ssize_t n = ::recv(impl->udpSocket_, buf, sizeof(buf), 0);
+        if (n <= 0 || (n == 1 && buf[0] == 0xFF)) {  // CrazySim answers a lone 0xFF with 0xFF
+          continue;
+        }
+        Packet p(buf, (size_t)n);
+        {
+          const std::lock_guard<std::mutex> lock(impl->queue_recv_mutex_);
+          p.seq_ = impl->statistics_.receive_count;
+          impl->queue_recv_.push(p);
+          ++impl->statistics_.receive_count;
+        }
+        impl->queue_recv_cv_.notify_one();
+      }
+    });
+
+    const std::lock_guard<std::mutex> lock(udp_registry_mutex);
+    udp_registry.push_back(impl_);
+    return;
+#endif
+  }
 
   const std::regex uri_regex("(usb:\\/\\/(\\d+)|radio:\\/\\/(\\d+|\\*)\\/(\\d+)\\/(250K|1M|2M)\\/([a-fA-F0-9]+|\\*)(\\?[\\w=&]+)?)|(radiobroadcast:\\/\\/(\\d+|\\*)\\/(\\d+)\\/(250K|1M|2M))");
   std::smatch match;
@@ -145,6 +252,24 @@ Connection::~Connection()
 
 void Connection::close()
 {
+#ifndef _WIN32
+  if (impl_->isUdp_) {
+    if (impl_->udpSocket_ < 0) {
+      return;
+    }
+    {
+      const std::lock_guard<std::mutex> lock(udp_registry_mutex);
+      udp_registry.erase(std::remove(udp_registry.begin(), udp_registry.end(), impl_), udp_registry.end());
+    }
+    impl_->udpStop_ = true;
+    if (impl_->udpThread_.joinable()) {
+      impl_->udpThread_.join();
+    }
+    ::close(impl_->udpSocket_);
+    impl_->udpSocket_ = -1;
+    return;
+  }
+#endif
   if (impl_->devid_ >= 0) {
     USBManager::get().removeConnection(impl_);
   }
@@ -252,6 +377,23 @@ std::vector<std::string> Connection::scan_selected(const std::vector<std::string
 
 void Connection::send(const Packet& p)
 {
+#ifndef _WIN32
+  if (impl_->isUdp_) {
+    ++impl_->statistics_.enqueued_count;
+    if (!impl_->udpBroadcast_) {
+      udp_send(*impl_, p);
+      return;
+    }
+    const std::lock_guard<std::mutex> lock(udp_registry_mutex);
+    // counted on each drone's connection: over UDP a broadcast is really one unicast per drone
+    for (auto& con : udp_registry) {
+      if (con->udpHost_ == impl_->udpHost_) {
+        udp_send(*con, p);
+      }
+    }
+    return;
+  }
+#endif
   const std::lock_guard<std::mutex> lock(impl_->queue_send_mutex_);
   if (!impl_->runtime_error_.empty()) {
     throw std::runtime_error(impl_->runtime_error_);
